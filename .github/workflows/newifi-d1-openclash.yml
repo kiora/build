@@ -2,6 +2,9 @@ name: Build Newifi D1 OpenClash
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - chatgpt-newifi-d1-openclash
 
 jobs:
   build:
