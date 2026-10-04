@@ -1,0 +1,39 @@
+name: Build Newifi D1 OpenClash
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+        with:
+          ref: chatgpt-newifi-d1-openclash
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            curl jq time xsltproc libelf-dev ecj fastjar java-propose-classpath python3 python3-dev \
+            python3-pip python3-ply python3-docutils python3-pyelftools libpython3-dev qemu-utils \
+            ccache subversion mercurial libtool-bin automake autoconf autopoint device-tree-compiler \
+            antlr3 asciidoc help2man intltool po4a libglib2.0-dev xmlto
+
+      - name: Build firmware
+        run: |
+          chmod +x chatgpt-newifi-d1/build_newifi_d1.sh
+          ./chatgpt-newifi-d1/build_newifi_d1.sh
+
+      - name: Upload output always
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newifi-d1-openclash-build-output
+          path: newifi-d1-output/
+          if-no-files-found: warn
+          retention-days: 7
