@@ -81,7 +81,7 @@ jobs:
           )
           excluded=(
             luci-app-ssr-plus zerotier luci-app-zerotier xray-core frpc luci-app-frpc
-            simple-obfs-client vlmcsd luci-app-vlmcsd vsftpd-alt luci-app-vsftpd
+            simple-obfs-client vlmcsd luci-app-vlmclsd vsftpd-alt luci-app-vsftpd
             samba36-server luci-app-samba
           )
 
@@ -111,8 +111,10 @@ jobs:
           grep -q '^START=90$' "$ROOTFS/etc/init.d/openclash_swap"
           grep -q '^START=95$' "$ROOTFS/etc/init.d/openclash_core_stage"
           grep -q "small_flash_memory='1'" "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
-          grep -q '/mnt/mmcblk0p1/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
-          grep -q '/tmp/etc/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^SD_MOUNT="/mnt/mmcblk0p1"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^SD_CORE="\$SD_MOUNT/openclash/core/clash_meta"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^RAM_DIR="/tmp/etc/openclash/core"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^RAM_CORE="\$RAM_DIR/clash_meta"$' "$ROOTFS/etc/init.d/openclash_core_stage"
           echo 'LOWMEM_SERVICES=PASS' >> "$REPORT"
 
           CORE_UPDATER="$ROOTFS/usr/share/openclash/openclash_core.sh"
