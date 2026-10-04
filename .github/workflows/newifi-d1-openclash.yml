@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - chatgpt-newifi-d1-openclash
+      - master
 
 jobs:
   build:
@@ -14,7 +14,7 @@ jobs:
       - name: Checkout helper repo
         uses: actions/checkout@v4
         with:
-          ref: chatgpt-newifi-d1-openclash
+          ref: master
 
       - name: Install build dependencies
         run: |
