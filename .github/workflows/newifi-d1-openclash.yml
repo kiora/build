@@ -13,7 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CACHE_PREFIX: newifi-d1-openclash-v4
+  # Bump this only when the pinned LEDE/feed baseline intentionally changes.
+  # Script fixes keep the same prefix so the next run restores the latest build tree.
+  CACHE_PREFIX: newifi-d1-openclash-20240513-v1
 
 jobs:
   build:
@@ -30,9 +32,9 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-restore
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-restore
           restore-keys: |
-            ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-
+            ${{ env.CACHE_PREFIX }}-
 
       - name: Install build dependencies
         run: |
@@ -56,7 +58,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-01-prepare
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-01-prepare
 
       - name: Step 2 - Download sources
         id: download
@@ -68,7 +70,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-02-download
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-02-download
 
       - name: Step 3 - Build tools and toolchain
         id: toolchain
@@ -81,7 +83,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-03-toolchain-${{ steps.toolchain.outcome }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-03-toolchain-${{ steps.toolchain.outcome }}
       - name: Gate toolchain
         if: steps.toolchain.outcome != 'success'
         run: exit 1
@@ -97,7 +99,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-04-target-${{ steps.target.outcome }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-04-target-${{ steps.target.outcome }}
       - name: Gate target
         if: steps.target.outcome != 'success'
         run: exit 1
@@ -113,7 +115,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-05-packages-${{ steps.packages.outcome }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-05-packages-${{ steps.packages.outcome }}
       - name: Gate packages
         if: steps.packages.outcome != 'success'
         run: exit 1
@@ -129,7 +131,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-06-world-${{ steps.world.outcome }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-06-world-${{ steps.world.outcome }}
       - name: Gate world
         if: steps.world.outcome != 'success'
         run: exit 1
@@ -144,7 +146,7 @@ jobs:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-07-verified
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-07-verified
 
       - name: Upload current progress/output
         if: always()
