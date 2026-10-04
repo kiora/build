@@ -1,0 +1,163 @@
+name: Audit Newifi D1 OpenClash RootFS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths:
+      - '.github/workflows/newifi-d1-rootfs-audit.yml'
+
+concurrency:
+  group: newifi-d1-rootfs-audit
+  cancel-in-progress: true
+
+env:
+  CACHE_PREFIX: newifi-d1-openclash-20240513-v1
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Restore completed firmware checkpoint
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-audit-restore
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-
+
+      - name: Install SquashFS audit tool
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y squashfs-tools
+
+      - name: Audit actual final rootfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          FINAL="$OUT/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin"
+          ROOTFS="$RUNNER_TEMP/newifi-d1-rootfs-audit"
+          REPORT="$OUT/ROOTFS_VALIDATION.txt"
+          PKGLIST="$OUT/ROOTFS_PACKAGE_LIST.txt"
+          test -s "$FINAL"
+          rm -rf "$ROOTFS"
+          : > "$REPORT"
+
+          OFFSET=$(python3 - "$FINAL" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          with open(p, 'rb') as f:
+              h = f.read(64)
+          if len(h) != 64 or h[:4] != b'\x27\x05\x19\x56':
+              raise SystemExit('not a legacy uImage')
+          size = struct.unpack('>I', h[12:16])[0]
+          print(64 + size)
+          PY
+          )
+          echo "ROOTFS_OFFSET=$OFFSET" | tee -a "$REPORT"
+          MAGIC=$(dd if="$FINAL" bs=1 skip="$OFFSET" count=4 status=none | od -An -tx1 | tr -d ' \n')
+          echo "ROOTFS_MAGIC=$MAGIC" | tee -a "$REPORT"
+          test "$MAGIC" = "68737173"
+
+          unsquashfs -s -o "$OFFSET" "$FINAL" | tee "$OUT/ROOTFS_SQUASHFS_INFO.txt"
+          unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
+          STATUS="$ROOTFS/usr/lib/opkg/status"
+          test -s "$STATUS"
+          awk '/^Package: /{p=$2} /^Version: /{print p " " $2}' "$STATUS" | sort > "$PKGLIST"
+
+          required=(
+            luci-app-openclash dnsmasq-full iptables iptables-mod-extra iptables-mod-tproxy
+            ipset kmod-ipt-ipset kmod-ipt-tproxy kmod-tun ppp ppp-mod-pppoe
+            block-mount e2fsprogs kmod-fs-ext4 kmod-mmc kmod-sdhci-mt7620 ruby ruby-yaml
+          )
+          excluded=(
+            luci-app-ssr-plus zerotier luci-app-zerotier xray-core frpc luci-app-frpc
+            simple-obfs-client vlmcsd luci-app-vlmcsd vsftpd-alt luci-app-vsftpd
+            samba36-server luci-app-samba
+          )
+
+          for p in "${required[@]}"; do
+            if grep -qE "^${p} " "$PKGLIST"; then
+              echo "REQUIRED_OK=$p" >> "$REPORT"
+            else
+              echo "REQUIRED_MISSING=$p" >> "$REPORT"
+              exit 1
+            fi
+          done
+          for p in "${excluded[@]}"; do
+            if grep -qE "^${p} " "$PKGLIST"; then
+              echo "EXCLUDED_PRESENT=$p" >> "$REPORT"
+              exit 1
+            else
+              echo "EXCLUDED_OK=$p" >> "$REPORT"
+            fi
+          done
+
+          OC_VER=$(awk '$1=="luci-app-openclash"{print $2}' "$PKGLIST")
+          echo "OPENCLASH_INSTALLED_VERSION=$OC_VER" >> "$REPORT"
+
+          test -x "$ROOTFS/etc/init.d/openclash_swap"
+          test -x "$ROOTFS/etc/init.d/openclash_core_stage"
+          test -s "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
+          grep -q '^START=90$' "$ROOTFS/etc/init.d/openclash_swap"
+          grep -q '^START=95$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q "small_flash_memory='1'" "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
+          grep -q '/mnt/mmcblk0p1/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '/tmp/etc/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
+          echo 'LOWMEM_SERVICES=PASS' >> "$REPORT"
+
+          CORE_UPDATER="$ROOTFS/usr/share/openclash/openclash_core.sh"
+          DEBUG_SCRIPT="$ROOTFS/usr/share/openclash/openclash_debug.sh"
+          CONTROLLER="$ROOTFS/usr/lib/lua/luci/controller/openclash.lua"
+          test -s "$CORE_UPDATER" && test -s "$DEBUG_SCRIPT" && test -s "$CONTROLLER"
+          grep -q '/mnt/mmcblk0p1/openclash/core/clash_meta' "$CORE_UPDATER"
+          grep -q 'core_meta_version="unknown"' "$DEBUG_SCRIPT"
+          echo 'LOWMEM_UPDATER_PATCH=PASS' >> "$REPORT"
+          echo 'LOWMEM_DEBUG_PROBE_PATCH=PASS' >> "$REPORT"
+
+          if find "$ROOTFS" -type f \( -name 'clash_meta' -o -name 'mihomo' -o -name 'clash' \) -print | grep -q .; then
+            echo 'ERROR=core_binary_embedded_in_rootfs' >> "$REPORT"
+            find "$ROOTFS" -type f \( -name 'clash_meta' -o -name 'mihomo' -o -name 'clash' \) -printf 'CORE_FILE=%p %s\n' >> "$REPORT"
+            exit 1
+          fi
+          echo 'NO_CORE_BINARY_IN_ROOTFS=PASS' >> "$REPORT"
+
+          python3 - "$CONTROLLER" "$REPORT" <<'PY'
+          import re, sys
+          path, report = sys.argv[1:]
+          s = open(path, 'r', errors='replace').read()
+          m = re.search(r'function\s+coremetacv\s*\(\)(.*?)(?=\nfunction\s+|\Z)', s, re.S)
+          status = 'UNKNOWN'
+          if m:
+              body = m.group(1)
+              status = 'PROBE_PRESENT' if re.search(r'meta_core_path.*-v|-v.*meta_core_path', body) else 'NO_EXTRA_PROBE'
+          with open(report, 'a') as f:
+              f.write('LUCI_CORE_VERSION_PROBE=' + status + '\n')
+          PY
+
+          sha256sum "$FINAL" >> "$REPORT"
+          echo 'ROOTFS_AUDIT=PASS' >> "$REPORT"
+          cat "$REPORT"
+          rm -rf "$ROOTFS"
+
+      - name: Upload rootfs audit result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newifi-d1-rootfs-audit-output
+          path: |
+            newifi-d1-output/ROOTFS_VALIDATION.txt
+            newifi-d1-output/ROOTFS_PACKAGE_LIST.txt
+            newifi-d1-output/ROOTFS_SQUASHFS_INFO.txt
+            newifi-d1-output/IMAGE_VALIDATION.txt
+            newifi-d1-output/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin
+          if-no-files-found: warn
+          retention-days: 7
