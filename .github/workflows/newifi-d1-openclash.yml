@@ -60,6 +60,41 @@ jobs:
             newifi-d1-output
           key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-01-prepare
 
+      - name: Apply final low-memory fixes to restored source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd newifi-d1-build/lede
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('package/luci-app-openclash/luasrc/controller/openclash.lua')
+          s=p.read_text()
+          s,n=re.subn(r'(?:local\s+)?function\s+coremetacv\(\).*?\nend', 'local function coremetacv()\n\treturn "unknown" -- avoid a second large core process\nend', s, count=1, flags=re.S)
+          if n != 1: raise SystemExit('coremetacv patch failed')
+          p.write_text(s)
+          p=Path('files/etc/init.d/openclash_core_stage')
+          s=p.read_text().replace('chmod 4755', 'chmod 755')
+          s=s.replace('cp -f "$SD_CORE" "$RAM_CORE.tmp" || return 1', 'cp -f "$SD_CORE" "$RAM_CORE.tmp" || return 1\n        cmp -s "$SD_CORE" "$RAM_CORE.tmp" || { rm -f "$RAM_CORE.tmp"; return 1; }')
+          p.write_text(s)
+          p=Path('files/etc/uci-defaults/99-openclash-lowmem')
+          s=p.read_text().replace("uci -q commit openclash", "uci -q set openclash.config.enable='0'\nuci -q set openclash.config.core_type='Meta'\nuci -q set openclash.config.core_version='linux-mipsle-softfloat'\n/etc/init.d/openclash disable\nuci -q commit openclash")
+          p.write_text(s)
+          p=Path('package/luci-app-openclash/root/usr/share/openclash/openclash_core.sh')
+          p.write_text(p.read_text().replace('chmod 4755 /mnt/mmcblk0p1', 'chmod 755 /mnt/mmcblk0p1'))
+          # Keep large mutable geodata out of Flash.
+          for rel in ('GeoSite.dat', 'rule_provider/oc-cn-domain.mrs'):
+              (Path('package/luci-app-openclash/root/etc/openclash')/rel).unlink(missing_ok=True)
+          PY
+          make package/luci-app-openclash/clean V=s
+          rm -f ../.checkpoints/packages.ready ../.checkpoints/world.ready ../.checkpoints/verify.ready
+          mkdir -p "$GITHUB_WORKSPACE/newifi-d1-output/applied-files"
+          cp -a files "$GITHUB_WORKSPACE/newifi-d1-output/applied-files/"
+          cp package/luci-app-openclash/luasrc/controller/openclash.lua "$GITHUB_WORKSPACE/newifi-d1-output/applied-files/"
+          cp package/luci-app-openclash/root/usr/share/openclash/openclash_core.sh "$GITHUB_WORKSPACE/newifi-d1-output/applied-files/"
+          cp package/luci-app-openclash/root/usr/share/openclash/openclash_debug.sh "$GITHUB_WORKSPACE/newifi-d1-output/applied-files/"
+          echo 'LUCI coremetacv patched; core copy byte-checked; first boot disabled; geodata excluded' >> "$GITHUB_WORKSPACE/newifi-d1-output/NEWIFI_LOW_MEMORY_PATCH_REPORT.txt"
+
       - name: Step 2 - Download sources
         id: download
         run: ./chatgpt-newifi-d1/build_newifi_d1.sh download
@@ -158,7 +193,7 @@ jobs:
           ROOTFS="$RUNNER_TEMP/newifi-d1-rootfs-audit"
           REPORT="$OUT/ROOTFS_VALIDATION.txt"
           PKGLIST="$OUT/ROOTFS_PACKAGE_LIST.txt"
-          rm -rf "$ROOTFS"
+          sudo rm -rf "$ROOTFS"
           : > "$REPORT"
 
           OFFSET=$(python3 - "$FINAL" <<'PY'
@@ -178,7 +213,7 @@ jobs:
           echo | tee -a "$REPORT"
 
           unsquashfs -s -o "$OFFSET" "$FINAL" | tee "$OUT/ROOTFS_SQUASHFS_INFO.txt"
-          unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
+          sudo unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
           test -s "$ROOTFS/usr/lib/opkg/status"
           STATUS="$ROOTFS/usr/lib/opkg/status"
           awk '/^Package: /{p=$2} /^Version: /{print p " " $2}' "$STATUS" | sort > "$PKGLIST"
@@ -220,8 +255,9 @@ jobs:
           grep -q '^START=90$' "$ROOTFS/etc/init.d/openclash_swap"
           grep -q '^START=95$' "$ROOTFS/etc/init.d/openclash_core_stage"
           grep -q "small_flash_memory='1'" "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
-          grep -q '/mnt/mmcblk0p1/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
-          grep -q '/tmp/etc/openclash/core/clash_meta' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q 'SD_MOUNT="/mnt/mmcblk0p1"' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -Fq 'SD_CORE="$SD_MOUNT/openclash/core/clash_meta"' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q 'RAM_DIR="/tmp/etc/openclash/core"' "$ROOTFS/etc/init.d/openclash_core_stage"
           echo 'LOWMEM_SERVICES=PASS' >> "$REPORT"
 
           CORE_UPDATER="$ROOTFS/usr/share/openclash/openclash_core.sh"
@@ -252,6 +288,7 @@ jobs:
               status = 'PROBE_PRESENT' if re.search(r'meta_core_path.*-v|-v.*meta_core_path', body) else 'NO_EXTRA_PROBE'
           with open(report, 'a') as f:
               f.write('LUCI_CORE_VERSION_PROBE=' + status + '\n')
+          if status != 'NO_EXTRA_PROBE': raise SystemExit('LuCI launches extra core')
           PY
 
           find "$ROOTFS/etc/openclash/core" -maxdepth 2 -type f -printf '%p %s\n' 2>/dev/null >> "$REPORT" || true
