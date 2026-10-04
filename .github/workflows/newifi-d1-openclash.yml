@@ -3,8 +3,17 @@ name: Build Newifi D1 OpenClash
 on:
   workflow_dispatch:
   push:
-    branches:
-      - master
+    branches: [ master ]
+    paths:
+      - 'chatgpt-newifi-d1/**'
+      - '.github/workflows/newifi-d1-openclash.yml'
+
+concurrency:
+  group: newifi-d1-openclash
+  cancel-in-progress: true
+
+env:
+  CACHE_PREFIX: newifi-d1-openclash-v4
 
 jobs:
   build:
@@ -13,8 +22,17 @@ jobs:
     steps:
       - name: Checkout helper repo
         uses: actions/checkout@v4
+
+      - name: Restore latest build checkpoint
+        id: restore
+        uses: actions/cache/restore@v4
         with:
-          ref: master
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-restore
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-
 
       - name: Install build dependencies
         run: |
@@ -26,13 +44,109 @@ jobs:
             python3-pip python3-ply python3-docutils python3-pyelftools libpython3-dev qemu-utils \
             ccache subversion mercurial libtool-bin automake autoconf autopoint device-tree-compiler \
             antlr3 asciidoc help2man intltool po4a libglib2.0-dev xmlto
-
-      - name: Build firmware
-        run: |
           chmod +x chatgpt-newifi-d1/build_newifi_d1.sh
-          ./chatgpt-newifi-d1/build_newifi_d1.sh
 
-      - name: Upload output always
+      - name: Step 1 - Prepare source and pinned feeds
+        id: prepare
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh prepare
+      - name: Save checkpoint 1 - prepare
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-01-prepare
+
+      - name: Step 2 - Download sources
+        id: download
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh download
+      - name: Save checkpoint 2 - download
+        if: always() && steps.download.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-02-download
+
+      - name: Step 3 - Build tools and toolchain
+        id: toolchain
+        continue-on-error: true
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh toolchain
+      - name: Save checkpoint 3 - toolchain partial or complete
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-03-toolchain-${{ steps.toolchain.outcome }}
+      - name: Gate toolchain
+        if: steps.toolchain.outcome != 'success'
+        run: exit 1
+
+      - name: Step 4 - Build target/kernel
+        id: target
+        continue-on-error: true
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh target
+      - name: Save checkpoint 4 - target partial or complete
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-04-target-${{ steps.target.outcome }}
+      - name: Gate target
+        if: steps.target.outcome != 'success'
+        run: exit 1
+
+      - name: Step 5 - Compile packages
+        id: packages
+        continue-on-error: true
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh packages
+      - name: Save checkpoint 5 - package partial or complete
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-05-packages-${{ steps.packages.outcome }}
+      - name: Gate packages
+        if: steps.packages.outcome != 'success'
+        run: exit 1
+
+      - name: Step 6 - Build final world/image
+        id: world
+        continue-on-error: true
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh world
+      - name: Save checkpoint 6 - world partial or complete
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-06-world-${{ steps.world.outcome }}
+      - name: Gate world
+        if: steps.world.outcome != 'success'
+        run: exit 1
+
+      - name: Step 7 - Verify sysupgrade image
+        id: verify
+        run: ./chatgpt-newifi-d1/build_newifi_d1.sh verify
+      - name: Save checkpoint 7 - verified
+        if: always() && steps.verify.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ hashFiles('chatgpt-newifi-d1/build_newifi_d1.sh') }}-${{ github.run_id }}-07-verified
+
+      - name: Upload current progress/output
         if: always()
         uses: actions/upload-artifact@v4
         with:
