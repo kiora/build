@@ -48,7 +48,7 @@ jobs:
           REPORT="$OUT/ROOTFS_VALIDATION.txt"
           PKGLIST="$OUT/ROOTFS_PACKAGE_LIST.txt"
           test -s "$FINAL"
-          rm -rf "$ROOTFS"
+          sudo rm -rf "$ROOTFS"
           : > "$REPORT"
 
           OFFSET=$(python3 - "$FINAL" <<'PY'
@@ -68,7 +68,8 @@ jobs:
           test "$MAGIC" = "68737173"
 
           unsquashfs -s -o "$OFFSET" "$FINAL" | tee "$OUT/ROOTFS_SQUASHFS_INFO.txt"
-          unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
+          sudo unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
           STATUS="$ROOTFS/usr/lib/opkg/status"
           test -s "$STATUS"
           awk '/^Package: /{p=$2} /^Version: /{print p " " $2}' "$STATUS" | sort > "$PKGLIST"
@@ -146,7 +147,7 @@ jobs:
           sha256sum "$FINAL" >> "$REPORT"
           echo 'ROOTFS_AUDIT=PASS' >> "$REPORT"
           cat "$REPORT"
-          rm -rf "$ROOTFS"
+          sudo rm -rf "$ROOTFS"
 
       - name: Upload rootfs audit result
         if: always()
