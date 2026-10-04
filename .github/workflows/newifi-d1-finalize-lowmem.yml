@@ -1,0 +1,267 @@
+name: Finalize Newifi D1 Low-Memory Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths:
+      - '.github/workflows/newifi-d1-finalize-lowmem.yml'
+
+concurrency:
+  group: newifi-d1-finalize-lowmem
+  cancel-in-progress: true
+
+env:
+  CACHE_PREFIX: newifi-d1-openclash-20240513-v1
+  BASE_CACHE_KEY: newifi-d1-openclash-20240513-v1-37178963961-07-verified
+  MTD_LIMIT: '33226752'
+
+jobs:
+  finalize:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout helper repo
+        uses: actions/checkout@v4
+
+      - name: Restore exact verified build checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.BASE_CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Install build and audit dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev \
+            libssl-dev python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            curl jq time xsltproc libelf-dev ecj fastjar java-propose-classpath python3 python3-dev \
+            python3-pip python3-ply python3-docutils python3-pyelftools libpython3-dev qemu-utils \
+            ccache subversion mercurial libtool-bin automake autoconf autopoint device-tree-compiler \
+            antlr3 asciidoc help2man intltool po4a libglib2.0-dev xmlto squashfs-tools
+
+      - name: Apply reproducible LuCI low-memory patch
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEDE="$GITHUB_WORKSPACE/newifi-d1-build/lede"
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          CTRL="$LEDE/package/luci-app-openclash/luasrc/controller/openclash.lua"
+          test "$(git -C "$LEDE" rev-parse HEAD)" = "41728362433b239f2927ef76ed1527bd9e5010af"
+          test -s "$CTRL"
+          python3 "$GITHUB_WORKSPACE/chatgpt-newifi-d1/patch_openclash_controller_lowmem.py" "$CTRL" | tee "$OUT/controller-lowmem-patch.log"
+          python3 - "$CTRL" <<'PY' | tee "$OUT/controller-lowmem-source-check.txt"
+          import re, sys
+          s=open(sys.argv[1], encoding='utf-8').read()
+          m=re.search(r'local function coremetacv\(\)(.*?)(?=\nlocal function|\Z)', s, re.S)
+          assert m, 'coremetacv block missing'
+          body=m.group(1)
+          assert 'return "unknown"' in body, 'low-memory replacement missing'
+          assert not re.search(r'\-v| -v', body), 'executable version probe still present'
+          print('CONTROLLER_SOURCE_PATCH=PASS')
+          PY
+          cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
+          stage=controller-source-patched
+          time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          base_cache=${BASE_CACHE_KEY}
+          EOF
+
+      - name: Rebuild only luci-app-openclash
+        id: openclash
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEDE="$GITHUB_WORKSPACE/newifi-d1-build/lede"
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          cd "$LEDE"
+          make package/luci-app-openclash/clean V=s 2>&1 | tee "$OUT/openclash-clean-final.log"
+          make -j1 package/luci-app-openclash/compile V=s 2>&1 | tee "$OUT/openclash-rebuild-final.log"
+          grep -q 'Packaged contents' "$OUT/openclash-rebuild-final.log"
+          cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
+          stage=openclash-package-rebuilt
+          time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          base_cache=${BASE_CACHE_KEY}
+          EOF
+      - name: Gate OpenClash rebuild
+        if: steps.openclash.outcome != 'success'
+        run: exit 1
+
+      - name: Rebuild final sysupgrade image
+        id: image
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEDE="$GITHUB_WORKSPACE/newifi-d1-build/lede"
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          TARGET="$LEDE/bin/targets/ramips/mt7621/openwrt-ramips-mt7621-lenovo_newifi-d1-squashfs-sysupgrade.bin"
+          FINAL="$OUT/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin"
+          OLD_SHA=$(sha256sum "$FINAL" | awk '{print $1}')
+          rm -f "$TARGET"
+          cd "$LEDE"
+          make -j1 V=s 2>&1 | tee "$OUT/world-final-lowmem.log"
+          test -s "$TARGET"
+          cp -f "$TARGET" "$FINAL"
+          NEW_SHA=$(sha256sum "$FINAL" | awk '{print $1}')
+          SIZE=$(stat -c %s "$FINAL")
+          test "$SIZE" -le "$MTD_LIMIT"
+          test "$NEW_SHA" != "$OLD_SHA"
+          {
+            echo "OLD_SHA256=$OLD_SHA"
+            echo "NEW_SHA256=$NEW_SHA"
+            echo "SIZE=$SIZE"
+            echo "MTD_LIMIT=$MTD_LIMIT"
+          } | tee "$OUT/FINAL_IMAGE_REBUILD.txt"
+          cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
+          stage=final-image-rebuilt
+          time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          sha256=$NEW_SHA
+          size=$SIZE
+          EOF
+      - name: Gate image rebuild
+        if: steps.image.outcome != 'success'
+        run: exit 1
+
+      - name: Audit actual rebuilt SquashFS rootfs
+        id: audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          FINAL="$OUT/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin"
+          ROOTFS="$RUNNER_TEMP/newifi-d1-final-rootfs-audit"
+          REPORT="$OUT/FINAL_ROOTFS_VALIDATION.txt"
+          PKGLIST="$OUT/FINAL_ROOTFS_PACKAGE_LIST.txt"
+          sudo rm -rf "$ROOTFS"
+          : > "$REPORT"
+
+          OFFSET=$(python3 - "$FINAL" <<'PY'
+          import struct, sys
+          h=open(sys.argv[1], 'rb').read(64)
+          assert len(h)==64 and h[:4]==b'\x27\x05\x19\x56'
+          print(64 + struct.unpack('>I', h[12:16])[0])
+          PY
+          )
+          echo "ROOTFS_OFFSET=$OFFSET" >> "$REPORT"
+          MAGIC=$(dd if="$FINAL" bs=1 skip="$OFFSET" count=4 status=none | od -An -tx1 | tr -d ' \n')
+          echo "ROOTFS_MAGIC=$MAGIC" >> "$REPORT"
+          test "$MAGIC" = "68737173"
+          unsquashfs -s -o "$OFFSET" "$FINAL" > "$OUT/FINAL_ROOTFS_SQUASHFS_INFO.txt"
+          sudo unsquashfs -f -d "$ROOTFS" -o "$OFFSET" "$FINAL" >/dev/null
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
+
+          STATUS="$ROOTFS/usr/lib/opkg/status"
+          test -s "$STATUS"
+          awk '/^Package: /{p=$2} /^Version: /{print p " " $2}' "$STATUS" | sort > "$PKGLIST"
+          required=(
+            luci-app-openclash dnsmasq-full iptables iptables-mod-extra iptables-mod-tproxy
+            ipset kmod-ipt-ipset kmod-ipt-tproxy kmod-tun ppp ppp-mod-pppoe
+            block-mount e2fsprogs kmod-fs-ext4 kmod-mmc kmod-sdhci-mt7620 ruby ruby-yaml
+          )
+          excluded=(
+            luci-app-ssr-plus zerotier luci-app-zerotier xray-core frpc luci-app-frpc
+            simple-obfs-client vlmcsd luci-app-vlmcsd vsftpd-alt luci-app-vsftpd
+            samba36-server luci-app-samba
+          )
+          for p in "${required[@]}"; do
+            grep -qE "^${p} " "$PKGLIST" || { echo "REQUIRED_MISSING=$p" >> "$REPORT"; exit 1; }
+            echo "REQUIRED_OK=$p" >> "$REPORT"
+          done
+          for p in "${excluded[@]}"; do
+            ! grep -qE "^${p} " "$PKGLIST" || { echo "EXCLUDED_PRESENT=$p" >> "$REPORT"; exit 1; }
+            echo "EXCLUDED_OK=$p" >> "$REPORT"
+          done
+          echo "OPENCLASH_INSTALLED_VERSION=$(awk '$1=="luci-app-openclash"{print $2}' "$PKGLIST")" >> "$REPORT"
+
+          test -x "$ROOTFS/etc/init.d/openclash_swap"
+          test -x "$ROOTFS/etc/init.d/openclash_core_stage"
+          test -s "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
+          grep -q '^START=90$' "$ROOTFS/etc/init.d/openclash_swap"
+          grep -q '^START=95$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q "small_flash_memory='1'" "$ROOTFS/etc/uci-defaults/99-openclash-lowmem"
+          grep -q '^SD_MOUNT="/mnt/mmcblk0p1"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^SD_CORE="\$SD_MOUNT/openclash/core/clash_meta"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^RAM_DIR="/tmp/etc/openclash/core"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          grep -q '^RAM_CORE="\$RAM_DIR/clash_meta"$' "$ROOTFS/etc/init.d/openclash_core_stage"
+          echo 'LOWMEM_SERVICES=PASS' >> "$REPORT"
+
+          CORE_UPDATER="$ROOTFS/usr/share/openclash/openclash_core.sh"
+          DEBUG_SCRIPT="$ROOTFS/usr/share/openclash/openclash_debug.sh"
+          CONTROLLER="$ROOTFS/usr/lib/lua/luci/controller/openclash.lua"
+          test -s "$CORE_UPDATER" && test -s "$DEBUG_SCRIPT" && test -s "$CONTROLLER"
+          grep -q '/mnt/mmcblk0p1/openclash/core/clash_meta' "$CORE_UPDATER"
+          grep -q 'core_meta_version="unknown"' "$DEBUG_SCRIPT"
+          echo 'LOWMEM_UPDATER_PATCH=PASS' >> "$REPORT"
+          echo 'LOWMEM_DEBUG_PROBE_PATCH=PASS' >> "$REPORT"
+
+          python3 - "$CONTROLLER" "$REPORT" <<'PY'
+          import re, sys
+          path, report = sys.argv[1:]
+          s=open(path, 'r', errors='replace').read()
+          m=re.search(r'local function coremetacv\(\)(.*?)(?=\nlocal function|\Z)', s, re.S)
+          assert m, 'coremetacv block missing'
+          body=m.group(1)
+          status='NO_EXTRA_PROBE' if ('return "unknown"' in body and not re.search(r'\-v| -v', body)) else 'PROBE_PRESENT'
+          with open(report, 'a') as f: f.write('LUCI_CORE_VERSION_PROBE='+status+'\n')
+          if status != 'NO_EXTRA_PROBE': raise SystemExit(1)
+          PY
+
+          if find "$ROOTFS" -type f \( -name 'clash_meta' -o -name 'mihomo' -o -name 'clash' \) -print | grep -q .; then
+            echo 'ERROR=core_binary_embedded_in_rootfs' >> "$REPORT"
+            exit 1
+          fi
+          echo 'NO_CORE_BINARY_IN_ROOTFS=PASS' >> "$REPORT"
+          SHA=$(sha256sum "$FINAL" | awk '{print $1}')
+          SIZE=$(stat -c %s "$FINAL")
+          echo "SHA256=$SHA" >> "$REPORT"
+          echo "SIZE=$SIZE" >> "$REPORT"
+          echo "MTD_LIMIT=$MTD_LIMIT" >> "$REPORT"
+          echo 'ROOTFS_AUDIT=PASS' >> "$REPORT"
+          cat "$REPORT"
+          sudo rm -rf "$ROOTFS"
+          cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
+          stage=final-rootfs-audited
+          time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          sha256=$SHA
+          size=$SIZE
+          result=PASS
+          EOF
+      - name: Gate final rootfs audit
+        if: steps.audit.outcome != 'success'
+        run: exit 1
+
+      - name: Save final low-memory build checkpoint
+        if: steps.audit.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            newifi-d1-build
+            newifi-d1-output
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-09-final-lowmem
+
+      - name: Upload final image and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newifi-d1-openclash-final-lowmem
+          path: |
+            newifi-d1-output/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin
+            newifi-d1-output/FINALIZE_CHECKPOINT.txt
+            newifi-d1-output/FINAL_IMAGE_REBUILD.txt
+            newifi-d1-output/FINAL_ROOTFS_VALIDATION.txt
+            newifi-d1-output/FINAL_ROOTFS_PACKAGE_LIST.txt
+            newifi-d1-output/FINAL_ROOTFS_SQUASHFS_INFO.txt
+            newifi-d1-output/controller-lowmem-patch.log
+            newifi-d1-output/controller-lowmem-source-check.txt
+            newifi-d1-output/openclash-rebuild-final.log
+            newifi-d1-output/world-final-lowmem.log
+            newifi-d1-output/SOURCE_LOCK.txt
+          if-no-files-found: warn
+          retention-days: 7
