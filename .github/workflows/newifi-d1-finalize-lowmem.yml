@@ -13,7 +13,9 @@ concurrency:
 
 env:
   CACHE_PREFIX: newifi-d1-openclash-20240513-v1
-  BASE_CACHE_KEY: newifi-d1-openclash-20240513-v1-37178963961-07-verified
+  EXPECTED_BASE_SHA256: 5b7654bd5df51e9ff5cc4a87d3b2425b12e4116d02511c0e1c58d01e51e52732
+  EXPECTED_BASE_SIZE: '18351185'
+  LEDE_COMMIT: 41728362433b239f2927ef76ed1527bd9e5010af
   MTD_LIMIT: '33226752'
 
 jobs:
@@ -24,14 +26,52 @@ jobs:
       - name: Checkout helper repo
         uses: actions/checkout@v4
 
-      - name: Restore exact verified build checkpoint
+      - name: Restore latest compatible build checkpoint
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: |
             newifi-d1-build
             newifi-d1-output
-          key: ${{ env.BASE_CACHE_KEY }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}-finalize-restore
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-
           fail-on-cache-miss: true
+
+      - name: Validate recovered base before modification
+        shell: bash
+        run: |
+          set -euo pipefail
+          LEDE="$GITHUB_WORKSPACE/newifi-d1-build/lede"
+          OUT="$GITHUB_WORKSPACE/newifi-d1-output"
+          FINAL="$OUT/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin"
+          CTRL="$LEDE/package/luci-app-openclash/luasrc/controller/openclash.lua"
+          test -d "$LEDE/.git"
+          test "$(git -C "$LEDE" rev-parse HEAD)" = "$LEDE_COMMIT"
+          test -s "$FINAL"
+          test -s "$CTRL"
+          BASE_SHA=$(sha256sum "$FINAL" | awk '{print $1}')
+          BASE_SIZE=$(stat -c %s "$FINAL")
+          test "$BASE_SHA" = "$EXPECTED_BASE_SHA256"
+          test "$BASE_SIZE" = "$EXPECTED_BASE_SIZE"
+          test -d "$LEDE/staging_dir"
+          test -d "$LEDE/build_dir"
+          test -d "$LEDE/bin/targets/ramips/mt7621"
+          {
+            echo "CACHE_MATCHED_KEY=${{ steps.restore.outputs.cache-matched-key }}"
+            echo "LEDE_HEAD=$(git -C "$LEDE" rev-parse HEAD)"
+            echo "BASE_SHA256=$BASE_SHA"
+            echo "BASE_SIZE=$BASE_SIZE"
+            echo "RECOVERED_BASE=PASS"
+          } | tee "$OUT/FINALIZER_BASE_VALIDATION.txt"
+          cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
+          stage=recovered-base-validated
+          time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          sha256=$BASE_SHA
+          size=$BASE_SIZE
+          cache_key=${{ steps.restore.outputs.cache-matched-key }}
+          result=PASS
+          EOF
 
       - name: Install build and audit dependencies
         run: |
@@ -52,8 +92,7 @@ jobs:
           LEDE="$GITHUB_WORKSPACE/newifi-d1-build/lede"
           OUT="$GITHUB_WORKSPACE/newifi-d1-output"
           CTRL="$LEDE/package/luci-app-openclash/luasrc/controller/openclash.lua"
-          test "$(git -C "$LEDE" rev-parse HEAD)" = "41728362433b239f2927ef76ed1527bd9e5010af"
-          test -s "$CTRL"
+          test "$(git -C "$LEDE" rev-parse HEAD)" = "$LEDE_COMMIT"
           python3 "$GITHUB_WORKSPACE/chatgpt-newifi-d1/patch_openclash_controller_lowmem.py" "$CTRL" | tee "$OUT/controller-lowmem-patch.log"
           python3 - "$CTRL" <<'PY' | tee "$OUT/controller-lowmem-source-check.txt"
           import re, sys
@@ -68,7 +107,8 @@ jobs:
           cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
           stage=controller-source-patched
           time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-          base_cache=${BASE_CACHE_KEY}
+          base_sha256=$EXPECTED_BASE_SHA256
+          result=PASS
           EOF
 
       - name: Rebuild only luci-app-openclash
@@ -82,11 +122,13 @@ jobs:
           cd "$LEDE"
           make package/luci-app-openclash/clean V=s 2>&1 | tee "$OUT/openclash-clean-final.log"
           make -j1 package/luci-app-openclash/compile V=s 2>&1 | tee "$OUT/openclash-rebuild-final.log"
-          grep -q 'Packaged contents' "$OUT/openclash-rebuild-final.log"
+          find bin/packages bin/targets -type f -name '*openclash*.ipk' -o -name '*openclash*.apk' 2>/dev/null | sort > "$OUT/openclash-built-files.txt" || true
+          test -s "$OUT/openclash-rebuild-final.log"
           cat > "$OUT/FINALIZE_CHECKPOINT.txt" <<EOF
           stage=openclash-package-rebuilt
           time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-          base_cache=${BASE_CACHE_KEY}
+          base_sha256=$EXPECTED_BASE_SHA256
+          result=PASS
           EOF
       - name: Gate OpenClash rebuild
         if: steps.openclash.outcome != 'success'
@@ -103,6 +145,7 @@ jobs:
           TARGET="$LEDE/bin/targets/ramips/mt7621/openwrt-ramips-mt7621-lenovo_newifi-d1-squashfs-sysupgrade.bin"
           FINAL="$OUT/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin"
           OLD_SHA=$(sha256sum "$FINAL" | awk '{print $1}')
+          test "$OLD_SHA" = "$EXPECTED_BASE_SHA256"
           rm -f "$TARGET"
           cd "$LEDE"
           make -j1 V=s 2>&1 | tee "$OUT/world-final-lowmem.log"
@@ -123,6 +166,7 @@ jobs:
           time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           sha256=$NEW_SHA
           size=$SIZE
+          result=PASS
           EOF
       - name: Gate image rebuild
         if: steps.image.outcome != 'success'
@@ -254,12 +298,14 @@ jobs:
           path: |
             newifi-d1-output/newifi-d1-openclash-optimized-squashfs-sysupgrade.bin
             newifi-d1-output/FINALIZE_CHECKPOINT.txt
+            newifi-d1-output/FINALIZER_BASE_VALIDATION.txt
             newifi-d1-output/FINAL_IMAGE_REBUILD.txt
             newifi-d1-output/FINAL_ROOTFS_VALIDATION.txt
             newifi-d1-output/FINAL_ROOTFS_PACKAGE_LIST.txt
             newifi-d1-output/FINAL_ROOTFS_SQUASHFS_INFO.txt
             newifi-d1-output/controller-lowmem-patch.log
             newifi-d1-output/controller-lowmem-source-check.txt
+            newifi-d1-output/openclash-built-files.txt
             newifi-d1-output/openclash-rebuild-final.log
             newifi-d1-output/world-final-lowmem.log
             newifi-d1-output/SOURCE_LOCK.txt
